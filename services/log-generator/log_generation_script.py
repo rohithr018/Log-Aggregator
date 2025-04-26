@@ -1,102 +1,152 @@
-import time
-import random
-import threading
-import socket
 import os
-import psutil
-import platform
+import re
+import json
+import time
+import socket
+import logging
+import threading
+from queue import Queue
 from datetime import datetime
-from pathlib import Path
+from kafka import KafkaProducer
+import pytz
 
-hostname = socket.gethostname()
+# Constants
+DEFAULT_KAFKA_BROKER = 'localhost:9092'
+TOPIC_NAME = "logs"
+LOG_DIR_PATH = "/var/log"
+IST = pytz.timezone("Asia/Kolkata")
 
-log_sources = [
-    ("systemd", 2879),
-    ("sshd", 985),
-    ("wpa_supplicant", 986),
-    ("tracker-miner-fs-3", 185321),
-    ("nginx", 1452),
-    ("python", os.getpid()),
-    ("docker", 9001),
-    ("kubelet", 1001),
-    ("zabbix-agent", 777),
-    ("monitor", 1111),
-    ("cron", 777),
-    ("kernel", 0),
-    ("dbus-daemon", 1234),
-    ("pulseaudio", 2222),
-]
+class EnhancedKafkaProducer:
+    def __init__(self, bootstrap_servers=DEFAULT_KAFKA_BROKER):
+        self.producer = KafkaProducer(
+            bootstrap_servers=bootstrap_servers,
+            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+            acks='all',
+            retries=3,
+            compression_type='gzip'
+        )
+        self.logger = logging.getLogger('kafka_producer')
+        
+    def send(self, topic, value):
+        try:
+            future = self.producer.send(topic, value)
+            future.add_callback(self._on_send_success)
+            future.add_errback(self._on_send_error)
+        except Exception as e:
+            self.logger.error(f"Failed to send message: {e}")
 
-log_levels = ["INFO", "DEBUG", "WARNING", "ERROR", "CRITICAL"]
+    def _on_send_success(self, record_metadata):
+        self.logger.debug(f"Message delivered to {record_metadata.topic} [{record_metadata.partition}]")
 
-# Format like journalctl
-def format_log(app, pid, message, level="INFO"):
-    timestamp = datetime.now().strftime("%b %d %H:%M:%S")
-    return f"{timestamp} {hostname} {app}[{pid}]: {level}: {message}"
+    def _on_send_error(self, excp):
+        self.logger.error(f"Message delivery failed: {excp}")
 
-# Generate system-based messages with log level
-def get_dynamic_message():
-    cpu = psutil.cpu_percent(interval=0.1)
-    mem = psutil.virtual_memory().percent
-    disk = psutil.disk_usage('/').percent
-    level = random.choices(log_levels, weights=[50, 20, 15, 10, 5])[0]
+class LogFileReader:
+    def __init__(self, log_dir: str, queue: Queue, shutdown_event: threading.Event):
+        self.log_dir = log_dir
+        self.queue = queue
+        self.shutdown_event = shutdown_event
+        self.hostname = socket.gethostname()
+        self.logger = logging.getLogger('log_file_reader')
+        self.excluded_files = {"cloud-init-output.log"}  # <== Add list of files to skip
 
-    messages = [
-        (f"CPU Load Averages: {os.getloadavg()}", "INFO"),
-        (f"Logged-in users: {len(psutil.users())}", "DEBUG"),
-        (f"System uptime: {time.time() - psutil.boot_time():.0f}s", "INFO"),
-        (f"High memory usage detected: {mem}%", "WARNING" if mem > 80 else "INFO"),
-        (f"Disk usage nearing limit: {disk}%", "WARNING" if disk > 85 else "INFO"),
-        (f"CPU utilization spike: {cpu}%", "CRITICAL" if cpu > 90 else "INFO"),
-        (f"Service restart triggered for nginx", "INFO"),
-        (f"SSH login attempt failed from 192.168.1.{random.randint(1, 255)}", "WARNING"),
-        (f"Permission denied accessing /var/log/syslog", "ERROR"),
-        (f"Kernel: Buffer overflow attempt detected", "CRITICAL"),
-        (f"User 'rohith' executed 'sudo systemctl restart docker'", "DEBUG"),
-        (f"Heartbeat check from docker container {random.randint(1000, 9999)}", "DEBUG"),
-        (f"Invalid config in /etc/nginx/sites-enabled/default", "ERROR"),
-        (f"Firewall dropped packet from suspicious IP", "WARNING"),
-        (f"Audio device not responding", "ERROR"),
-        (f"New cron job scheduled for midnight", "INFO"),
-        (f"DBUS: No route to destination", "ERROR"),
-        (f"Tracker indexer failed to access mounted drive", "WARNING"),
-    ]
-    
-    message, msg_level = random.choice(messages)
-    return message, msg_level if level == "INFO" else level  # blend level or override
+    def _is_readable_log_file(self, filepath):
+        filename = os.path.basename(filepath)
+        if filename in self.excluded_files:  # <== Skip excluded files
+            return False
+        return os.path.isfile(filepath) and os.access(filepath, os.R_OK) and not filepath.endswith(('.gz', '.xz', '.zip', '.bz2'))
 
-# Emit general logs
-def generate_logs():
-    while True:
-        app, pid = random.choice(log_sources)
-        msg, level = get_dynamic_message()
-        print(format_log(app, pid, msg, level))
-        time.sleep(random.uniform(0.1, 0.4))
+    def _parse_line(self, line, source_file):
+        # Generic parsing fallback: Apr 25 14:32:01 myhost CRON[1234]: Message
+        match = re.match(r"^(\w{3} +\d+ \d{2}:\d{2}:\d{2}) ([\w\-.]+) ([\w\-.\/]+)(?:\[(\d+)\])?: (.*)", line)
+        if match:
+            ts_str, host, app, pid, message = match.groups()
+        else:
+            ts_str = None
+            host = self.hostname
+            app = os.path.basename(source_file)
+            pid = 0
+            message = line.strip()
 
-# System monitor logs (consistent)
-def generate_monitor_logs():
-    while True:
-        cpu = psutil.cpu_percent(interval=1)
-        mem = psutil.virtual_memory().percent
-        log = format_log("monitor", os.getpid(), f"System Monitor - CPU: {cpu:.1f}%, Memory: {mem:.1f}%", "INFO")
-        print(log)
-        time.sleep(2)
+        return {
+            "timestamp": datetime.now(IST).isoformat(),
+            "hostname": host,
+            "application": app,
+            "pid": int(pid) if pid else 0,
+            "level": "INFO",  # Could enhance with real detection
+            "message": message,
+            "metadata": {
+                "source_file": source_file,
+                "environment": os.getenv("ENVIRONMENT", "production"),
+                "region": os.getenv("REGION", "unknown")
+            }
+        }
+
+    def stream_logs(self):
+        try:
+            for root, _, files in os.walk(self.log_dir):
+                for file in files:
+                    filepath = os.path.join(root, file)
+                    if not self._is_readable_log_file(filepath):
+                        continue
+                    try:
+                        with open(filepath, 'r', errors='ignore') as f:
+                            for line in f:
+                                if self.shutdown_event.is_set():
+                                    return
+                                if line.strip():
+                                    parsed = self._parse_line(line, filepath)
+                                    self.queue.put(parsed)
+                                    print(f"[{parsed['timestamp']}] [{parsed['application']}] [{parsed['level']}]: {parsed['message']}")
+                                    time.sleep(0.01)  # Avoid flooding Kafka
+                    except Exception as fe:
+                        self.logger.warning(f"Failed to read {filepath}: {fe}")
+        except Exception as e:
+            self.logger.error(f"Error walking log directory: {e}", exc_info=True)
+
+def kafka_sender(queue: Queue, shutdown_event: threading.Event):
+    producer = EnhancedKafkaProducer()
+    logger = logging.getLogger('kafka_sender')
+    while not shutdown_event.is_set() or not queue.empty():
+        try:
+            record = queue.get(timeout=1)
+            producer.send(TOPIC_NAME, record)
+            queue.task_done()
+        except Exception:
+            continue
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler()
+        ]
+    )
 
 if __name__ == "__main__":
-    threads = []
-
-    for _ in range(5):
-        t = threading.Thread(target=generate_logs)
-        t.daemon = True
-        t.start()
-        threads.append(t)
-
-    monitor_thread = threading.Thread(target=generate_monitor_logs)
-    monitor_thread.daemon = True
-    monitor_thread.start()
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    log_queue = Queue()
+    shutdown_event = threading.Event()
 
     try:
+        reader = LogFileReader(LOG_DIR_PATH, log_queue, shutdown_event)
+        reader_thread = threading.Thread(target=reader.stream_logs)
+        reader_thread.start()
+
+        sender_thread = threading.Thread(target=kafka_sender, args=(log_queue, shutdown_event))
+        sender_thread.start()
+
+        logger.info("Log file reader started. Press Ctrl+C to stop...")
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[Log Generator Stopped]")
+        logger.info("Shutting down...")
+        shutdown_event.set()
+        reader_thread.join()
+        log_queue.join()
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+    finally:
+        logger.info("Shutdown complete.")
